@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Mapping
 
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_metadata import (
-    ABSORBED_MESSAGE_UIDS, CANONICAL_ROW, DB_ROW_SNAPSHOT, MESSAGE_UID, RESTORED_FROM_STORE, TOOL_CALL_UIDS,
+    ABSORBED_MESSAGE_UIDS, CANONICAL_ROW, DB_ROW_SNAPSHOT, MESSAGE_UID, RESTORED_FROM_STORE, TOOL_CALL_UIDS, TYPED_ASK,
     copy_identity_fields, message_uid_or_none)
 from hermes_state_common import _id_chunks, _placeholders
 from hermes_state_identity import _fill_missing_tool_call_uids, _restore_row_identity
@@ -258,6 +258,9 @@ def resolve_and_repair_transcript_batch(
                 if any(target_row[column] != serialized[column] for column in _OWNED_COLUMNS):
                     _rewrite_row(conn, session_id, target_row, serialized)
                     wrote = True
+                    # Hand back metadata as written: the rewrite may have removed a stamp the content outlived.
+                    target_row = conn.execute(
+                        "SELECT * FROM messages WHERE id = ? AND session_id = ?", (target_id, session_id)).fetchone()
                 missing = {c: target_row[c] for c in _LIVE_MISSING_METADATA if msg.get(c) is None}
                 if any(value is not None for value in missing.values()):
                     decoded = decode_row_fn(target_row)
@@ -312,11 +315,18 @@ def _rewrite_row(
         ).fetchall()
     ] if old_identity is not None else []
 
-    # Owned columns only: same-process metadata writes (a reaction, a backfill) stay as committed.
+    # Owned columns only: same-process metadata writes (a reaction, a backfill) stay as committed. One exception:
+    # the typed-ask stamp names the content it was taken from, so new content whose live dict no longer carries it
+    # (a fold dropped it) removes it, or a reload would read the old ask for the merged row.
     assignments = ", ".join(f"{column} = ?" for column in _OWNED_COLUMNS)
+    ask = f"'$.{TYPED_ASK}'"
+    stamp_outlived_content = (f"json_valid(display_metadata) AND json_extract(display_metadata, {ask}) IS NOT NULL "
+                              f"AND content IS NOT ? AND json_extract(COALESCE(?, '{{}}'), {ask}) IS NULL")
     conn.execute(
-        f"UPDATE messages SET {assignments} WHERE id = ? AND session_id = ?",
-        [*(serialized[column] for column in _OWNED_COLUMNS), int(target_row["id"]), session_id],
+        f"UPDATE messages SET {assignments}, display_metadata = CASE WHEN {stamp_outlived_content} "
+        f"THEN json_remove(display_metadata, {ask}) ELSE display_metadata END WHERE id = ? AND session_id = ?",
+        [*(serialized[column] for column in _OWNED_COLUMNS), serialized["content"], serialized["display_metadata"],
+         int(target_row["id"]), session_id],
     )
     _restore_display_index(conn, session_id, target_row, serialized, old_identity, old_peer_ids)
 
